@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A Config Rule and SSM document to check AD users
+Resources:
+
+# 1. Lambda and components
+  ConfigRuleLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import json, boto3, logging
+          from pprint import pformat
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ssm = boto3.client('ssm')
+          def lambda_handler(event, context):
+              logger.info("Starting evaluation. Received event from Config:")
+              logger.info(pformat(event))
+              evaluation_token = event['resultToken']
+              rule_region = event['configRuleArn'].split(':')[3]
+              rule_name = event['configRuleName']
+              rule_params = json.loads(event['ruleParameters'])
+              document_name = rule_params['EVALUATION_DOC']
+              command_execution = ssm.send_command(
+                  Targets=[{"Key":"tag:Application","Values":["ActiveDirectory"]}],
+                  DocumentName=document_name,
+                  Comment='Check AD user compliance',
+                  Parameters={"executionTimeout":["600"],"resultToken":[evaluation_token],"ruleName":[rule_name],"ruleRegion":[rule_region]})
+              logger.info('SSM document run command has been sent to DCs. CommandId:' + command_execution['Command']['CommandId'])
+      Description: "Check AD users password human users should not have never expire. Service accounts password less than 90 days"
+      FunctionName: config_lambda_check_ad_user
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.6
+      Timeout: 300
+
+  LambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: LambdaRoleForADConfigCheck
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "PermissionForADConfigCheck"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Join [ "", [ 'arn:aws:ssm:', !Ref "AWS::Region", ':', !Ref "AWS::AccountId", ':document/', !Ref ADUserEvaluationDoc] ]
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - arn:aws:ec2:*:*:instance/*
+                Condition:
+                  StringLike:
+                    ssm:resourceTag/Application: 'ActiveDirectory'
+
+  ConfigInvokingLambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt ConfigRuleLambda.Arn
+      Principal: !Sub 'config.${AWS::Region}.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+
+# 2. Config Rule
+  ADUsersCheckConfigRule:
+    DependsOn: ConfigInvokingLambdaPermission
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: "ad_users_password_policy"
+      Description: "Check AD users password. Normal accounts should not have password never expire. Service accounts password age less than 90 days"
+      InputParameters:
+        EVALUATION_DOC: !Ref ADUserEvaluationDoc
+      Source:
+        Owner: "CUSTOM_LAMBDA"
+        SourceDetails:
+          - EventSource: "aws.config"
+            MaximumExecutionFrequency: "One_Hour"
+            MessageType: "ScheduledNotification"
+        SourceIdentifier: !GetAtt ConfigRuleLambda.Arn
+
+# 3. SSM document
+  ADUserEvaluationDoc:
+    Type: "AWS::SSM::Document"
+    Properties:
+      DocumentType: Command
+      Content:
+        description: Evaluate AD users based on password policy
+        schemaVersion: '2.2'
+        parameters:
+          executionTimeout:
+            description: "(Optional) The time in seconds for a command to be completed before it is considered to have failed. Default is 600 seconds."
+            type: String
+            default: "600"
+            allowedPattern: "([1-9][0-9]{0,4})|(1[0-6][0-9]{4})|(17[0-1][0-9]{3})|(172[0-7][0-9]{2})|(172800)"
+          ruleRegion:
+            description: "Region of the Config rule"
+            type: String
+          resultToken:
+            description: "Token for the Config evaluation"
+            type: String
+          ruleName:
+            description: "Config Rule name for clean up previous evaluation results"
+            type: String
+        mainSteps:
+        - action: aws:runPowerShellScript
+          name: CheckADUsers
+          inputs:
+            timeoutSeconds: "{{ executionTimeout }}"
+            runCommand:
+              - |
+                Set-DefaultAWSRegion -Region "{{ ruleRegion }}"
+                $dc = Get-ADDomainController
+                $pdc = Get-ADDomainController -Discover -Domain $dc.Domain -Service "PrimaryDC"
+                if ($dc.Name -eq $pdc.Name) {
+                  $token = "{{ resultToken }}"
+                  Import-Module AWSPowerShell
+                  $normalUsers = Get-Aduser -Filter 'Name -notLike "service_*"' -Properties Name, PasswordNeverExpires, PasswordLastSet
+                  $badNonServiceUsers = $normalUsers | where({ $_.PasswordNeverExpires })
+                  $serviceUsers = Get-Aduser -Filter 'Name -Like "service_*"' -Properties Name, PasswordNeverExpires, PasswordLastSet
+                  $allowedPasswdAge = 90
+                  $dateToday = Get-Date
+                  $badServiceUsers = $serviceUsers | where({ (New-TimeSpan -Start $_.PasswordLastSet -end $dateToday).days -gt $allowedPasswdAge })
+                  $allUsers = $normalUsers + $serviceUsers
+                  $badUsers = $badNonServiceUsers + $badServiceUsers
+                  Remove-CFGEvaluationResult -ConfigRuleName "{{ ruleName }}"
+                  Foreach ($user in $allUsers)
+                  {
+                    $complianceType = If ($badUsers -contains $user) {"NON_COMPLIANT"} Else {"COMPLIANT"}
+                    $evaluation = New-Object Amazon.ConfigService.Model.Evaluation
+                    $evaluation.ComplianceResourceId = $user.Name
+                    $evaluation.ComplianceResourceType = 'AWS::::Account'
+                    $evaluation.ComplianceType = $complianceType
+                    $evaluation.OrderingTimestamp = Get-Date
+                    Write-CFGEvaluation -Evaluation $evaluation -ResultToken $token
+                  }
+                }
+
+# 4. Independent policy for EC2 instance
+  ADInstanceRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: AD_User_Config_Check_EC2_Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+            - config:DeleteEvaluationResults
+          Resource:
+            - !GetAtt ADUsersCheckConfigRule.Arn
+        - Effect: Allow
+          Action:
+            - config:PutEvaluations
+          Resource: '*'
